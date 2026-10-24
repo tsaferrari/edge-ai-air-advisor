@@ -1,0 +1,21 @@
+[Unit]
+Description=BME690 indoor/outdoor environment logger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tejo
+WorkingDirectory=/home/tejo/tejo_projects/bme690_read
+Environment=PYTHONUNBUFFERED=1
+# Set these to your location for outdoor weather/air quality
+Environment=LAT=52.205
+Environment=LON=0.119
+Environment=SENSOR_INTERVAL_S=60
+Environment=WEATHER_INTERVAL_S=900
+ExecStart=/home/tejo/.virtualenvs/pimoroni/bin/python3 /home/tejo/tejo_projects/bme690_read/logger.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
