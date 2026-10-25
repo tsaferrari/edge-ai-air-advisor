@@ -1,0 +1,14 @@
+[Unit]
+Description=hailo-ollama LLM server on the AI HAT+ 2
+After=network.target
+
+[Service]
+Type=simple
+User=tejo
+# Check the path with: which hailo-ollama
+ExecStart=/usr/bin/hailo-ollama
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

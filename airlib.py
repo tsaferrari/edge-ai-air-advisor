@@ -15,6 +15,7 @@ import math
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -82,6 +83,20 @@ class Decision:
     derived: dict = field(default_factory=dict)
 
 
+def _fine_reasons(f: dict, gas: float | None) -> list[str]:
+    """Concrete reasons when no action is needed, so the LLM has something real to say."""
+    reasons = []
+    if 40 <= f["indoor_rh"] <= HUMID_RH:
+        reasons.append(f"indoor humidity is comfortable ({f['indoor_rh']:.0f}%)")
+    elif f["indoor_rh"] < 40:
+        reasons.append(f"indoor air is on the dry side ({f['indoor_rh']:.0f}%) but not a problem")
+    if gas is not None:
+        reasons.append("the indoor air isn't stale")
+    if 18 <= f["indoor_temp"] <= WARM_C:
+        reasons.append(f"the room is at a comfortable {f['indoor_temp']:.1f}C")
+    return reasons or ["indoor conditions are fine"]
+
+
 def decide(f: dict) -> Decision:
     """f needs: indoor_temp, indoor_rh, outdoor_temp, outdoor_rh.
     Optional: outdoor_aqi, gas_ratio, tonight_min_temp."""
@@ -128,7 +143,7 @@ def decide(f: dict) -> Decision:
     if not useful:
         if moisture:
             return Decision("keep_closed", reasons, derived)
-        return Decision("no_action", reasons or ["indoor conditions are fine"], derived)
+        return Decision("no_action", reasons or _fine_reasons(f, gas), derived)
     if aqi_bad:
         reasons.append(f"but outdoor air quality is poor (European AQI {aqi:.0f})")
         return Decision("keep_closed", reasons, derived)
@@ -151,13 +166,21 @@ def facts_text(f: dict) -> str:
     return s + "."
 
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
+MAX_SENTENCES = 1            # longer replies are trimmed to this many sentences
+
+# Generation settings sent to the model server for the advice message.
+# num_predict caps the reply length (fewer tokens = less time and energy on the HAT).
+# If the server rejects "options", ask_llm retries without them.
+PHRASE_OPTIONS = {"num_predict": int(os.getenv("LLM_MAX_TOKENS", "60")),
+                  "temperature": float(os.getenv("LLM_TEMPERATURE", "0.3"))}
 
 
 def build_prompt(f: dict, d: Decision) -> str:
     return (
-        "Tell the user what to do about their room's air and why, in one or two plain sentences.\n"
-        "Rules: no greeting, no sign-off, no headings, no quotation marks. "
+        "Write ONE short sentence (at most 25 words) telling the user what to do about the air "
+        "in their room, and the main reason why. Begin with what to do.\n"
+        "Rules: no greeting, no sign-off, no lists, no extra tips. "
         "Use only the facts and reasons below; do not add any other facts or numbers. "
         "Do not change the decision.\n\n"
         f"Facts: {facts_text(f)}\n"
@@ -172,13 +195,26 @@ def strip_think(text: str) -> str:
     return text.rsplit("</think>", 1)[1] if "</think>" in text else text
 
 
-def ask_llm(prompt: str, model: str = DEFAULT_MODEL, timeout: int = LLM_TIMEOUT_S) -> tuple[str, float]:
-    body = json.dumps({"model": model, "stream": False,
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(LLM_URL, data=body, headers={"Content-Type": "application/json"})
+_options_supported = True
+
+
+def ask_llm(prompt: str, model: str = DEFAULT_MODEL, timeout: int = LLM_TIMEOUT_S,
+            options: dict | None = None) -> tuple[str, float]:
+    global _options_supported
+    payload = {"model": model, "stream": False, "messages": [{"role": "user", "content": prompt}]}
+    if options and _options_supported:
+        payload["options"] = options
+    req = urllib.request.Request(LLM_URL, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        text = json.load(resp)["message"]["content"]
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = json.load(resp)["message"]["content"]
+    except urllib.error.HTTPError as exc:
+        if "options" in payload and 400 <= exc.code < 500:
+            _options_supported = False   # server doesn't accept options; don't send them again
+            return ask_llm(prompt, model, timeout)
+        raise
     return strip_think(text).strip(), time.monotonic() - t0
 
 
@@ -202,6 +238,19 @@ class GuardResult:
     text: str
     problems: list[str]
     format_issues: list[str]  # what had to be cleaned up (for benchmarking)
+
+
+_FILLER = {"is", "are", "the", "a", "right", "now", "at", "this", "time", "currently", "required", "needed"}
+
+
+def _words(s: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", s.lower()))
+
+
+def _repeats_decision(sentence: str, action: str) -> bool:
+    """True if the sentence only restates the decision line from the prompt."""
+    w = _words(sentence)
+    return bool(w) and w <= _words(ACTION_TEXT[action]) | _FILLER
 
 
 def split_sentences(text: str) -> list[str]:
@@ -251,15 +300,34 @@ def guard(raw: str, prompt: str, action: str) -> GuardResult:
     if text[:1].islower():
         text = text[0].upper() + text[1:]
 
+    # Small models often start by repeating the decision line from the prompt, then give
+    # the reason, then pad (extra tips, restating facts). Keep the repeated decision plus
+    # the first real sentence, and trim the padding instead of rejecting the whole reply.
     sentences = split_sentences(text)
-    if len(sentences) > 2:
-        format_issues.append(f"{len(sentences)} sentences")
+    copies = 0
+    while copies < len(sentences) and _repeats_decision(sentences[copies], action):
+        copies += 1
+    keep = min(len(sentences), copies + MAX_SENTENCES)
+    if copies:
+        format_issues.append("repeated the decision")
+    if len(sentences) > keep:
+        format_issues.append(f"trimmed {len(sentences)} to {keep} sentences")
+        sentences = sentences[:keep]
+        text = " ".join(sentences)
+    only_copy = bool(sentences) and copies >= len(sentences)
+    if text and text[-1] not in ".!?":
+        format_issues.append("cut off")      # reply hit the length cap mid-sentence
+        if len(sentences) > 1:
+            sentences = sentences[:-1]
+            text = " ".join(sentences)
+        else:
+            problems.append("unfinished sentence")
 
     # Hard checks: these make the message unusable
     if not text:
         problems.append("empty message")
-    if len(sentences) > 3:
-        problems.append(f"too long ({len(sentences)} sentences)")
+    elif only_copy:
+        problems.append("only repeated the decision, no reason given")
     extra = sorted(set(NUM_RE.findall(text)) - _allowed_numbers(prompt))
     if extra:
         problems.append(f"numbers not in the facts: {', '.join(extra)}")

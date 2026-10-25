@@ -1,0 +1,23 @@
+[Unit]
+Description=Air advisor on the Display HAT Mini
+Wants=network-online.target
+After=network-online.target env-logger.service hailo-ollama.service
+
+[Service]
+Type=simple
+User=tejo
+WorkingDirectory=/home/tejo/tejo_projects/bme690_read
+Environment=PYTHONUNBUFFERED=1
+Environment=MODEL=qwen2.5-instruct:1.5b
+# Window glazing U-value: 5.8 single, 2.8 older double, 1.4 modern double, 0.8 triple
+Environment=GLAZING_U=2.8
+# Seconds without a button press before the screen turns off (0 = always on)
+Environment=SCREEN_TIMEOUT_S=300
+# Set to 180 if the picture is upside down
+Environment=ROTATE=0
+ExecStart=/home/tejo/.virtualenvs/pimoroni/bin/python3 /home/tejo/tejo_projects/bme690_read/display.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

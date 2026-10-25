@@ -257,12 +257,14 @@ def run_local(model: str, reps: int, label: str, only: str | None, timeout: int)
     for rep in range(1, reps + 1):
         for c in cases:
             try:
-                raw, secs = airlib.ask_llm(c["prompt"], model=model, timeout=timeout)
+                opts = airlib.PHRASE_OPTIONS if c["category"] == "phrasing" else None
+                raw, secs = airlib.ask_llm(c["prompt"], model=model, timeout=timeout, options=opts)
                 ok, metrics = score(c, raw)
             except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as exc:
                 raw, secs, ok, metrics = "", None, False, {"error": str(exc)}
             row = dict(run_id=run_id, time=datetime.now().isoformat(timespec="seconds"), label=label,
-                       model=model, rep=rep, case=c["id"], category=c["category"],
+                       model=model, prompt_version=airlib.PROMPT_VERSION, rep=rep,
+                       case=c["id"], category=c["category"],
                        secs=secs, raw=raw, metrics=metrics, **{"pass": ok})
             rows.append(row)
             save([row])  # save as we go, so a long run isn't lost if interrupted

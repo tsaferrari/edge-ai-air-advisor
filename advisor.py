@@ -2,13 +2,16 @@
 """
 Ventilation + condensation advisor.
 
-Reads the latest indoor (BME690) and outdoor (Open-Meteo) data logged by logger.py,
-fetches tonight's forecast low, decides what to do with deterministic rules (airlib.decide),
-then asks the LLM on the AI HAT+ 2 to phrase the advice. The LLM output is checked by
-airlib.guard; if it fails, a rule-based message is shown instead.
+Reads the latest indoor (BME690) and outdoor (Open-Meteo) data logged by
+logger.py, fetches tonight's forecast low, decides what to do with fixed rules
+(airlib.decide), then asks the LLM on the AI HAT+ 2 to phrase the advice. The
+LLM output is checked by airlib.guard; if it fails, a rule-based message is
+shown instead.
+
+The functions here are also used by display.py.
 
 Usage:
-    python3 advisor.py                                   # default model (Qwen2.5-Instruct)
+    python3 advisor.py                                   # default model (Qwen)
     MODEL=deepseek_r1_distill_qwen:1.5b python3 advisor.py
     GLAZING_U=1.4 python3 advisor.py                     # modern double glazing
 """
@@ -33,6 +36,11 @@ FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast"
     f"?latitude={LAT}&longitude={LON}&hourly=temperature_2m&forecast_hours=12&timezone=UTC"
 )
+LLM_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, KeyError, ValueError)
+
+
+class NotEnoughData(Exception):
+    """The database doesn't have an indoor and an outdoor reading yet."""
 
 
 def iso_ago(minutes: int) -> str:
@@ -56,12 +64,13 @@ def gather_facts(conn: sqlite3.Connection) -> dict:
     outdoor = q("SELECT temperature_c, humidity_pct, precipitation_mm, european_aqi "
                 "FROM outdoor ORDER BY ts DESC LIMIT 1")
     if not indoor or not outdoor:
-        sys.exit("Not enough data yet: need at least one indoor and one outdoor reading.")
+        raise NotEnoughData("Need at least one indoor and one outdoor reading.")
 
     f = {"indoor_temp": indoor[1], "indoor_rh": indoor[2],
          "outdoor_temp": outdoor[0], "outdoor_rh": outdoor[1],
          "outdoor_rain_mm": outdoor[2], "outdoor_aqi": outdoor[3]}
-    f["data_age_min"] = (datetime.now(timezone.utc) - datetime.fromisoformat(indoor[0])).total_seconds() / 60
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(indoor[0])
+    f["data_age_min"] = age.total_seconds() / 60
 
     hour_ago = q("SELECT humidity_pct FROM indoor WHERE ts <= ? ORDER BY ts DESC LIMIT 1", iso_ago(60))
     f["rh_change_1h"] = f["indoor_rh"] - hour_ago[0] if hour_ago else None
@@ -74,10 +83,47 @@ def gather_facts(conn: sqlite3.Connection) -> dict:
     return f
 
 
+def load_facts() -> dict:
+    """Latest facts from the database (read-only, so it never blocks the logger)."""
+    if not DB_PATH.exists():
+        raise NotEnoughData(f"No database yet at {DB_PATH}. Is the logger running?")
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        return gather_facts(conn)
+    finally:
+        conn.close()
+
+
+def fallback_text(d: airlib.Decision) -> str:
+    return f"{airlib.ACTION_TEXT[d.action]} Reason: {'; '.join(d.reasons)}."
+
+
+def phrase(f: dict, d: airlib.Decision) -> dict:
+    """Ask the LLM to phrase the decision and check its answer.
+
+    Returns a dict with: ok, text, source ("llm" or "fallback"), secs, reason,
+    raw, format_issues. If the LLM fails or its answer is rejected, text is
+    the rule-based fallback.
+    """
+    prompt = airlib.build_prompt(f, d)
+    try:
+        raw, secs = airlib.ask_llm(prompt, options=airlib.PHRASE_OPTIONS)
+    except LLM_ERRORS as exc:
+        return dict(ok=False, text=fallback_text(d), source="fallback", secs=None,
+                    reason=f"LLM unavailable: {exc}", raw=None, format_issues=[])
+    g = airlib.guard(raw, prompt, d.action)
+    if g.ok:
+        return dict(ok=True, text=g.text, source="llm", secs=secs, reason=None,
+                    raw=raw, format_issues=g.format_issues)
+    return dict(ok=False, text=fallback_text(d), source="fallback", secs=secs,
+                reason="rejected: " + "; ".join(g.problems), raw=raw, format_issues=g.format_issues)
+
+
 def main() -> None:
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)  # read-only: never blocks the logger
-    f = gather_facts(conn)
-    conn.close()
+    try:
+        f = load_facts()
+    except NotEnoughData as exc:
+        sys.exit(f"Not enough data yet: {exc}")
     f["tonight_min_temp"] = tonight_min_temp()
 
     d = airlib.decide(f)
@@ -99,23 +145,21 @@ def main() -> None:
     for r in d.reasons:
         print(f"  - {r}")
 
-    fallback = f"{airlib.ACTION_TEXT[d.action]} Reason: {'; '.join(d.reasons)}."
-    prompt = airlib.build_prompt(f, d)
-    try:
-        raw, secs = airlib.ask_llm(prompt)
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as exc:
-        print(f"\n(LLM unavailable: {exc}) Fallback advice:\n{fallback}")
-        return
-
-    g = airlib.guard(raw, prompt, d.action)
-    tag = f"{airlib.DEFAULT_MODEL}, {secs:.1f}s on AI HAT, prompt {airlib.PROMPT_VERSION}"
-    if g.ok:
-        cleaned = f", cleaned: {', '.join(g.format_issues)}" if g.format_issues else ""
-        print(f"\nAdvisor ({tag}{cleaned}):\n{g.text}")
+    p = phrase(f, d)
+    tag = f"{airlib.DEFAULT_MODEL}, prompt {airlib.PROMPT_VERSION}"
+    if p["secs"] is not None:
+        tag = f"{airlib.DEFAULT_MODEL}, {p['secs']:.1f}s on AI HAT, prompt {airlib.PROMPT_VERSION}"
+    if p["ok"]:
+        cleaned = f", cleaned: {', '.join(p['format_issues'])}" if p["format_issues"] else ""
+        print(f"\nAdvisor ({tag}{cleaned}):\n{p['text']}")
+        if p["format_issues"]:
+            print(f"  model wrote: {p['raw']!r}")
+    elif p["raw"] is None:
+        print(f"\n({p['reason']}) Fallback advice:\n{p['text']}")
     else:
-        print(f"\nAdvisor ({tag}) REJECTED by guard: {'; '.join(g.problems)}")
-        print(f"  model said: {raw!r}")
-        print(f"Fallback advice:\n{fallback}")
+        print(f"\nAdvisor ({tag}) REJECTED by guard: {p['reason'].removeprefix('rejected: ')}")
+        print(f"  model said: {p['raw']!r}")
+        print(f"Fallback advice:\n{p['text']}")
 
 
 if __name__ == "__main__":

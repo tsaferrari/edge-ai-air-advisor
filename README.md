@@ -4,7 +4,8 @@ An indoor air advisor running on a Raspberry Pi 5 with the Raspberry Pi AI HAT+
 2 (Hailo-10H) and a Pimoroni BME690 sensor. It compares the air in my room with
 the weather outside and tells me when opening a window will actually help, and
 when it won't. It also warns about overnight condensation on the windows. The
-language model runs locally on the AI HAT, so nothing leaves the house.
+advice is shown on a small Display HAT Mini screen. The language model runs
+locally on the AI HAT, so nothing leaves the house.
 
 I also used the project to answer a question I was curious about: what can a
 1.5B-parameter model on an edge accelerator do reliably, and where does it fall
@@ -61,8 +62,9 @@ flowchart LR
     R --> P[Prompt]
     P --> H[LLM on AI HAT+ 2<br/>hailo-ollama]
     H --> G{Output check}
-    G -->|passes| U[Advice to user]
+    G -->|passes| U[Display HAT Mini]
     G -->|fails| FB[Rule-based fallback]
+    FB --> U
 ```
 
 1. `logger.py` runs as a systemd service. It reads the BME690 every minute and
@@ -78,17 +80,38 @@ flowchart LR
    window closed if outdoor air quality is poor, and to open it only briefly if
    it's cold out.
 4. The model (Qwen2.5-Instruct 1.5B on the Hailo-10H) turns the decision and the
-   reasons into one or two plain sentences.
-5. `airlib.guard()` strips greetings, sign-offs and placeholders, and rejects
-   the message if it contains numbers that aren't in the data or contradicts the
-   decision.
+   reasons into one short sentence. The reply length is capped, which brought
+   generation time down from about 33 s to under 10 s.
+5. `airlib.guard()` cleans up the reply: it strips greetings, sign-offs and
+   placeholders, and trims padding after the first useful sentence. It rejects
+   the message if it contains numbers that aren't in the data, contradicts the
+   decision, or only repeats the decision without a reason.
+6. `display.py` shows the result on the Display HAT Mini. Everything except text
+   generation runs on the Pi's CPU (reading data, maths, decisions, checking the
+   reply, drawing the screen). Only the language model runs on the AI HAT.
+
+## The display
+
+Three pages, one per button: A shows the advice, B the indoor and outdoor
+readings, and X tonight's condensation risk for the windows. Y asks the model
+for fresh advice.
+
+![Display pages](docs/display-pages.png)
+
+To save power, the model only runs when the decision changes (or every 30
+minutes), the backlight turns off after 5 minutes without a button press, and
+the screen is only redrawn when a value changes. A dim LED shows the current
+decision in green, blue or amber, so the status is visible with the screen off.
+A new recommendation turns the screen back on by itself.
 
 ## Hardware
 
-- Raspberry Pi 5 (4 GB) running Raspberry Pi OS Bookworm
+- Raspberry Pi 5 (4 GB) running Raspberry Pi OS (Debian 13 Trixie, Python 3.13)
 - Raspberry Pi AI HAT+ 2: Hailo-10H with 8 GB of on-board RAM, firmware 5.1.1
 - Pimoroni BME690: temperature, humidity, pressure and gas (VOC) over I2C
-- Display HAT Mini (planned) to show the advice on a small screen
+- Pimoroni Display HAT Mini: 2" 320x240 screen, four buttons and an RGB LED,
+  stacked on top of the AI HAT. The BME690 plugs into its Qw/ST connector on a
+  longer cable, so heat from the boards doesn't affect the readings.
 
 ## What's in the repo
 
@@ -96,12 +119,15 @@ flowchart LR
 - `logger.py` and `env-logger.service`: the data logger and its systemd unit
 - `airlib.py`: shared physics, decision rules, prompt, model client and output
   check
-- `advisor.py`: the advisor itself
+- `advisor.py`: the advisor, from the command line
+- `display.py` and `env-display.service`: the advisor on the Display HAT Mini
+- `hailo-ollama.service`: starts the model server at boot
 - `eval.py`: the 32-case test suite, for local models and a blind frontier test
 - `power_log.py`: measures the Pi's power draw while a command runs
 - `eval_results/`: every model output from the tests, plus the results report
 - `power_logs/`: the raw power measurements
 - `docs/`: findings, test method and results, model and power benchmarks
+- `tools/mdfmt.py`: keeps the Markdown docs wrapped and their tables aligned
 
 ## Running it
 
@@ -122,10 +148,27 @@ curl -s http://localhost:8000/api/pull -d '{"model": "qwen2.5-instruct:1.5b"}'
 # 5.8 single, 2.8 older double, 1.4 modern double, 0.8 triple glazing
 python3 advisor.py
 
+# Model server and display as services
+sudo cp hailo-ollama.service env-display.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hailo-ollama env-display
+
 # Tests
 python3 eval.py --model qwen2.5-instruct:1.5b --reps 3
 python3 eval.py --report
 ```
+
+## Raspberry Pi 5 setup notes
+
+Two things needed fixing to get the Display HAT Mini working on the Pi 5:
+
+- `RPi.GPIO` doesn't support the Pi 5's RP1 GPIO chip and fails with "Cannot
+  determine SOC peripheral base address". The `rpi-lgpio` package is a drop-in
+  replacement (`pip uninstall RPi.GPIO`, then `pip install rpi-lgpio`).
+- The display uses GPIO 9 as its data/command pin, but with SPI enabled the
+  kernel claims GPIO 9 as SPI MISO, so the display driver can't use it ("Invalid
+  argument"). In `/boot/firmware/config.txt`, replace `dtparam=spi=on` with
+  `dtoverlay=spi0-2cs,no_miso`, which enables SPI without claiming that pin.
 
 ## Limitations and next steps
 
@@ -137,8 +180,13 @@ python3 eval.py --report
 - Outdoor conditions come from Open-Meteo's models, not a local sensor.
 - The window-glass temperature is a simple steady-state estimate. In reality,
   frames and edges are colder than the middle of the glass.
-- Next: show the advice on the Display HAT, and send a condensation warning
-  before bedtime.
+- The results table above was measured with prompt v2 and the stricter output
+  check. Prompt v3 (one sentence, length cap, trimming instead of rejecting)
+  still needs to be re-run through the test suite.
+- A small model can still give a wrong explanation, for example that opening a
+  window "keeps warm air out". The output check catches wrong numbers and wrong
+  actions, but not a wrong explanation.
+- Next: a condensation warning before bedtime.
 - Later: "ask your room", where you type a question like "How humid was it
   today?" and get an answer from the logged data. The model would pick one of a
   few Python query functions (for example `humidity_summary` for today), Python

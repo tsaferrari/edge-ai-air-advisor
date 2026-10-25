@@ -7,3 +7,4 @@ data/
 *.log
 nohup.out
 eval_results/results.before_rescore.jsonl
+shots/
