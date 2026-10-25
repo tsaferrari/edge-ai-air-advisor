@@ -12,7 +12,7 @@ short compared with a large cloud model? To find out, I built a 32-case test
 suite and ran it on two on-device models and one frontier model, Claude Opus 5.5
 (Medium).
 
-<!-- Add a photo of the setup here: ![Setup](docs/setup.jpg) -->
+![Raspberry Pi 5 with AI HAT+ 2 and BME690 sensor](docs/setup.jpg)
 
 ## Results
 
